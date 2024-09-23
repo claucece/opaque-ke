@@ -9,6 +9,10 @@
 use core::convert::TryFrom;
 use core::ops::Add;
 
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Key,
+};
 use derive_where::derive_where;
 use digest::core_api::{BlockSizeUser, CoreProxy};
 use digest::{Output, OutputSizeUser};
@@ -29,9 +33,10 @@ use crate::keypair::{KeyPair, PublicKey};
 use crate::opaque::{bytestrings_from_identifiers, Identifiers};
 use crate::serialization::{Input, MacExt};
 
-// Constant string used as salt for HKDF computation
+// Constant string used as salt for each HKDF computation
 const STR_AUTH_KEY: [u8; 7] = *b"AuthKey";
 const STR_EXPORT_KEY: [u8; 9] = *b"ExportKey";
+const STR_WRAPPING_KEY: [u8; 11] = *b"WrappingKey";
 const STR_PRIVATE_KEY: [u8; 10] = *b"PrivateKey";
 type NonceLen = U32;
 
@@ -191,12 +196,23 @@ where
             .expand_multi_info(&[&nonce, &STR_EXPORT_KEY], &mut export_key)
             .map_err(|_| InternalError::HkdfError)?;
 
-        let mut hmac = Hmac::<OprfHash<CS>>::new_from_slice(&hmac_key)
+        //let mut hmac = Hmac::<OprfHash<CS>>::new_from_slice(&hmac_key)
+        let mut hmac = <Hmac<OprfHash<CS>> as KeyInit>::new_from_slice(&hmac_key)
             .map_err(|_| InternalError::HmacError)?;
         hmac.update(&nonce);
         hmac.update_iter(aad);
 
         let hmac_bytes = hmac.finalize().into_bytes();
+
+        let mut wrapping_key = [0u8; 32];
+        OsRng.fill_bytes(&mut wrapping_key);
+
+        let key: &Key<Aes256Gcm> = Key::<Aes256Gcm>::from_slice(export_key.as_slice());
+        let cipher = Aes256Gcm::new(&key);
+        let aes_nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits; unique per message
+        let ciphertext = cipher
+            .encrypt(&aes_nonce, wrapping_key.as_slice())
+            .map_err(|_| InternalError::HkdfError)?; // TODO: change
 
         Ok((
             Self {
@@ -260,7 +276,8 @@ where
             .expand(&self.nonce.concat(STR_EXPORT_KEY.into()), &mut export_key)
             .map_err(|_| InternalError::HkdfError)?;
 
-        let mut hmac = Hmac::<OprfHash<CS>>::new_from_slice(&hmac_key)
+        let mut hmac = <Hmac<OprfHash<CS>> as KeyInit>::new_from_slice(&hmac_key)
+            //let mut hmac = Hmac::<OprfHash<CS>>::new_from_slice(&hmac_key)
             .map_err(|_| InternalError::HmacError)?;
         hmac.update(&self.nonce);
         hmac.update_iter(aad);
